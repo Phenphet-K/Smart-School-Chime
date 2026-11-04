@@ -8,10 +8,9 @@ env/
 venv/
 .venv/
 
-# PyInstaller / Build
+# PyInstaller / Build output
 build/
 dist/
-*.spec
 
 # Broadcast temp audio & runtime SSL certificates (auto-generated)
 data/live_broadcast_temp.wav

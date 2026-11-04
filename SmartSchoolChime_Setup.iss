@@ -1,4 +1,4 @@
-; Inno Setup Script for Smart School Chime
+; Script generated for Smart School Chime Setup
 #define MyAppName "Smart School Chime"
 #define MyAppVersion "1.0.0"
 #define MyAppPublisher "Phenphet-K"
@@ -13,18 +13,19 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-DefaultDirName={autopf}\{#MyAppName}
+DefaultDirName={commonpf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
-DisableProgramGroupPage=yes
-LicenseFile=LICENSE
+AllowNoIcons=yes
 OutputDir=dist
 OutputBaseFilename=SmartSchoolChime_Setup_v1.0.0
 SetupIconFile=icon.ico
+UninstallDisplayIcon={app}\icon.ico
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
+ArchitecturesInstallIn64BitMode=x64compatible
+ArchitecturesAllowed=x64compatible
 PrivilegesRequired=admin
-ArchitecturesInstallIn64BitMode=x64
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -34,17 +35,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "firewall"; Description: "Allow Smart School Chime through Windows Firewall for Mobile Broadcast"; GroupDescription: "Network Configuration:"
 
 [Files]
-Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
-Source: "logo.png"; DestDir: "{app}"; Flags: ignoreversion
-Source: "icon.png"; DestDir: "{app}"; Flags: ignoreversion
-Source: "nvdaControllerClient64.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "LICENSE"; DestDir: "{app}"; Flags: ignoreversion
-Source: "Config\settings.json"; DestDir: "{app}\Config"; Flags: onlyifdoesntexist
-Source: "data\school_time.db"; DestDir: "{app}\data"; Flags: onlyifdoesntexist
-Source: "data\initial_schedule.json"; DestDir: "{app}\data"; Flags: ignoreversion
-Source: "Sound\*"; DestDir: "{app}\Sound"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Copy everything from dist\SmartSchoolChime (including Config, data, Sound, exe, dll, icons)
+Source: "dist\SmartSchoolChime\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icon.ico"
@@ -56,5 +48,5 @@ Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""Smart S
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Smart School Chime"""; Flags: runhidden
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Smart School Chime"""; Flags: runhidden; RunOnceId: "DelFirewallRule"
 
