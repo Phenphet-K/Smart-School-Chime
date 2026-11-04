@@ -1,0 +1,9 @@
+{
+  "app_name": "Smart School Chime",
+  "day_mode": "all_day",
+  "bell_pack": "Sound01",
+  "voice_lang": "thai",
+  "auto_shutdown": "0",
+  "shutdown_hour": "17",
+  "shutdown_minute": "00"
+}

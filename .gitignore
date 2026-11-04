@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# PyInstaller / Build
+build/
+dist/
+*.spec
+
+# Broadcast temp audio & runtime SSL certificates (auto-generated)
+data/live_broadcast_temp.wav
+Config/cert.pem
+Config/key.pem
+
+# Heavy legacy installers (200MB+ Access Database Engines not needed by Python SQLite)
+legacy/MS Access*/
+Sound/*_backup/
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
