@@ -18,8 +18,9 @@ data/live_broadcast_temp.wav
 Config/cert.pem
 Config/key.pem
 
-# Heavy legacy installers (200MB+ Access Database Engines not needed by Python SQLite)
-legacy/MS Access*/
+# Legacy and Recovered Source Folders
+legacy/
+Recovered_VB_Source/
 Sound/*_backup/
 
 # Operating System Files

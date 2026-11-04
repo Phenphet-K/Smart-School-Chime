@@ -154,7 +154,7 @@ class SmartSchoolChimeApp(tk.Tk):
             os.path.join(base_dir, "logo.ico"),
             os.path.join(base_dir, "icon.png"),
             os.path.join(base_dir, "logo.png"),
-            os.path.join(base_dir, "legacy", "stt-icon.ico"),
+            os.path.join(base_dir, "assets", "stt-icon.ico"),
             os.path.join(os.getcwd(), "icon.ico"),
             os.path.join(os.getcwd(), "logo.ico"),
             os.path.join(os.getcwd(), "icon.png"),
