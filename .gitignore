@@ -27,3 +27,11 @@ Sound/*_backup/
 Thumbs.db
 ehthumbs.db
 [Dd]esktop.ini
+
+# Local test and runtime output
+.pytest_cache/
+logs/
+Updates/
+.coverage
+htmlcov/
+data/announcement-*.wav

@@ -1,67 +1,84 @@
-"""
-Configuration Manager for Smart School Chime
-Handles loading and saving app settings in /config/settings.json
-"""
-
-import os
+"""Validated, atomic configuration storage. JSON is the source of truth."""
 import json
 import logging
+import os
+import tempfile
+import threading
+from pathlib import Path
+import app_paths
 
-logger = logging.getLogger("ConfigManager")
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_DIR = os.path.join(BASE_DIR, "config")
-CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.json")
-
+logger = logging.getLogger('ConfigManager')
+CONFIG_DIR = str(app_paths.CONFIG_DIR)
+CONFIG_FILE = str(Path(CONFIG_DIR) / 'settings.json')
+_lock = threading.RLock()
 DEFAULT_SETTINGS = {
-    "app_name": "Smart School Chime",
-    "day_mode": "all_day",       # "all_day" or "each_day"
-    "bell_pack": "Sound01",       # Sound01..05
-    "voice_lang": "thai",         # "thai", "eng", or "both"
-    "auto_shutdown": "0",         # "0" or "1"
-    "shutdown_hour": "17",
-    "shutdown_minute": "00"
+    'app_name': 'Smart School Chime', 'day_mode': 'all_day',
+    'bell_pack': 'Sound01', 'voice_lang': 'thai', 'auto_shutdown': '0',
+    'shutdown_hour': '17', 'shutdown_minute': '00',
 }
 
-def init_config():
-    """Ensure /config folder and settings.json exist with defaults"""
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    if not os.path.exists(CONFIG_FILE):
+
+def validate_settings(data):
+    if not isinstance(data, dict):
+        raise ValueError('Settings must be an object')
+    result = DEFAULT_SETTINGS.copy()
+    result.update({key: str(value) for key, value in data.items()})
+    for key, choices in {'day_mode': ('all_day', 'each_day'),
+                         'voice_lang': ('thai', 'eng', 'both'),
+                         'auto_shutdown': ('0', '1')}.items():
+        if result[key] not in choices:
+            raise ValueError(f'Invalid setting: {key}')
+    for key, maximum in [('shutdown_hour', 23), ('shutdown_minute', 59)]:
+        if not result[key].isdigit() or not 0 <= int(result[key]) <= maximum:
+            raise ValueError(f'Invalid setting: {key}')
+        result[key] = result[key].zfill(2)
+    pack = result['bell_pack']
+    if not pack or any(c in pack for c in '/\\:') or pack in ('.', '..'):
+        raise ValueError('Invalid bell pack')
+    return result
+
+
+def save_all_settings(settings_dict):
+    settings = validate_settings(settings_dict)
+    with _lock:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        temporary = None
         try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(DEFAULT_SETTINGS, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"Error creating initial {CONFIG_FILE}: {e}")
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                             dir=CONFIG_DIR, delete=False) as stream:
+                temporary = stream.name
+                json.dump(settings, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, CONFIG_FILE)
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
 
-def load_all_settings() -> dict:
-    """Load settings dictionary from config/settings.json"""
-    init_config()
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            merged = DEFAULT_SETTINGS.copy()
-            merged.update(data)
-            return merged
-    except Exception as e:
-        logger.error(f"Error loading {CONFIG_FILE}: {e}")
-        return DEFAULT_SETTINGS.copy()
 
-def save_all_settings(settings_dict: dict):
-    """Save full settings dictionary into config/settings.json"""
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(settings_dict, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"Error writing {CONFIG_FILE}: {e}")
+def init_config():
+    with _lock:
+        if not os.path.exists(CONFIG_FILE):
+            save_all_settings(DEFAULT_SETTINGS)
 
-def get_config(key: str, default=None):
-    """Get single configuration value"""
-    settings = load_all_settings()
-    return settings.get(key, default if default is not None else DEFAULT_SETTINGS.get(key))
 
-def set_config(key: str, value):
-    """Update single configuration value in config/settings.json"""
-    settings = load_all_settings()
-    settings[key] = str(value)
-    save_all_settings(settings)
+def load_all_settings():
+    with _lock:
+        init_config()
+        try:
+            with open(CONFIG_FILE, encoding='utf-8') as stream:
+                return validate_settings(json.load(stream))
+        except (ValueError, TypeError, OSError):
+            logger.exception('Cannot load settings; using safe defaults')
+            return DEFAULT_SETTINGS.copy()
+
+
+def get_config(key, default=None):
+    return load_all_settings().get(key, default)
+
+
+def set_config(key, value):
+    with _lock:
+        settings = load_all_settings()
+        settings[key] = str(value)
+        save_all_settings(settings)

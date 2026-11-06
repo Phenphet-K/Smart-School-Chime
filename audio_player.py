@@ -4,41 +4,25 @@ Plays .wav files using Windows native winsound in background threads
 """
 
 import os
-import sys
-import time
 import threading
 import logging
 import winsound
+from collections import deque
+import app_paths
+from audio_formats import playable_wave
 
 logger = logging.getLogger("AudioPlayer")
 
 class AudioPlayer:
     def __init__(self, base_dir=None):
-        if base_dir is None:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.base_dir = base_dir
-        
-        # Search for Sound folder (/sound or /Sound)
-        possible_paths = [
-            os.path.join(self.base_dir, "sound"),
-            os.path.join(self.base_dir, "Sound"),
-            os.path.join(os.getcwd(), "sound"),
-            os.path.join(os.getcwd(), "Sound"),
-            "C:\\sound",
-            "C:\\Sound"
-        ]
-        self.sound_dir = None
-        for p in possible_paths:
-            if os.path.exists(p):
-                self.sound_dir = p
-                break
-        
-        if not self.sound_dir:
-            self.sound_dir = os.path.join(self.base_dir, "Sound")
-            
-        self._is_playing = False
-        self._stop_event = threading.Event()
-        self._current_thread = None
+        self.base_dir = base_dir or str(app_paths.INSTALL_DIR)
+        self.sound_dir = os.path.join(base_dir, 'Sound') if base_dir else str(app_paths.SOUND_DIR)
+        self._condition = threading.Condition(threading.RLock())
+        self._queue = deque()
+        self._current = None
+        self._closed = False
+        self._worker = threading.Thread(target=self._run, name='ChimeAudio', daemon=True)
+        self._worker.start()
 
     def get_sound_path(self, *rel_path):
         return os.path.join(self.sound_dir, *rel_path)
@@ -61,28 +45,77 @@ class AudioPlayer:
             return sorted([f for f in os.listdir(con_dir) if f.lower().endswith(".wav")])
         return []
 
-    def stop(self):
-        """Stop current audio playback"""
-        self._stop_event.set()
+    def _callback(self, callback, *args):
+        if callback:
+            try:
+                callback(*args)
+            except Exception:
+                logger.exception('Audio callback failed')
+
+    def _cancel_locked(self):
+        cancelled = list(self._queue)
+        self._queue.clear()
+        for job in cancelled:
+            job['cancel'].set()
+        if self._current:
+            self._current['cancel'].set()
         try:
-            winsound.PlaySound(None, winsound.SND_PURGE)
-        except Exception:
-            pass
-        self._is_playing = False
+            winsound.PlaySound(None, 0)
+        except RuntimeError:
+            logger.exception('Cannot stop audio output')
+        return cancelled
+
+    def stop(self):
+        with self._condition:
+            cancelled = self._cancel_locked()
+            self._condition.notify_all()
+        for job in cancelled:
+            self._callback(job['cleanup'])
+
+    def close(self):
+        with self._condition:
+            self._closed = True
+        self.stop()
+        self._worker.join(timeout=3)
 
     def is_playing(self):
-        return self._is_playing
+        with self._condition:
+            return bool(self._current or self._queue)
 
-    def _play_file_sync(self, file_path):
-        if self._stop_event.is_set():
-            return
-        if os.path.exists(file_path):
+    def _play_file_sync(self, file_path, cancel):
+        # Use asynchronous WinMM playback so cancellation is not tied to WAV duration.
+        with playable_wave(file_path, cancel) as (filename, duration):
+            with self._condition:
+                if cancel.is_set():
+                    return
+                winsound.PlaySound(filename, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+            cancel.wait(duration)
+            with self._condition:
+                winsound.PlaySound(None, 0)
+
+    def _run(self):
+        while True:
+            with self._condition:
+                self._condition.wait_for(lambda: self._closed or self._queue)
+                if self._closed:
+                    return
+                job = self._queue.popleft()
+                self._current = job
             try:
-                winsound.PlaySound(file_path, winsound.SND_FILENAME)
-            except Exception as e:
-                logger.error(f"Error playing {file_path}: {e}")
-        else:
-            logger.warning(f"Audio file not found: {file_path}")
+                for filename in job['files']:
+                    if job['cancel'].is_set():
+                        break
+                    self._play_file_sync(filename, job['cancel'])
+                if not job['cancel'].is_set():
+                    self._callback(job['finish'])
+            except Exception as error:
+                logger.exception('Audio playback failed')
+                self._callback(job['error'], error)
+            finally:
+                self._callback(job['cleanup'])
+                with self._condition:
+                    self._current = None
+                    self._condition.notify_all()
 
     def _build_time_thai(self, hour, minute):
         files = []
@@ -108,34 +141,29 @@ class AudioPlayer:
             files.append(self.get_sound_path("Eng", f"{m_int}.wav"))
         return files
 
-    def play_sequence_async(self, file_list, on_finish=None):
-        """Play a list of .wav files consecutively in background thread"""
-        self.stop()
-        self._stop_event.clear()
-
-        def runner():
-            self._is_playing = True
-            try:
-                for f in file_list:
-                    if self._stop_event.is_set():
-                        break
-                    self._play_file_sync(f)
-            finally:
-                self._is_playing = False
-                if on_finish and not self._stop_event.is_set():
-                    try:
-                        on_finish()
-                    except Exception:
-                        pass
-
-        self._current_thread = threading.Thread(target=runner, daemon=True)
-        self._current_thread.start()
+    def play_sequence_async(self, file_list, on_finish=None, *, enqueue=False,
+                            on_cleanup=None, on_error=None):
+        job = dict(files=list(file_list), finish=on_finish, cleanup=on_cleanup,
+                   error=on_error, cancel=threading.Event())
+        cancelled = []
+        with self._condition:
+            if self._closed:
+                raise RuntimeError('Audio player is closed')
+            if enqueue and len(self._queue) >= 64:
+                raise RuntimeError('Audio queue is full')
+            if not enqueue:
+                cancelled = self._cancel_locked()
+            self._queue.append(job)
+            self._condition.notify_all()
+        for previous in cancelled:
+            self._callback(previous['cleanup'])
+        return job['cancel']
 
     def play_bell(self, bell_pack, kind="First", on_finish=None):
         file_path = self.get_sound_path("Bell", bell_pack, f"{kind}.wav")
         self.play_sequence_async([file_path], on_finish)
 
-    def play_slot_event(self, slot_data, bell_pack="Sound01", voice_lang="thai", on_finish=None):
+    def play_slot_event(self, slot_data, bell_pack="Sound01", voice_lang="thai", on_finish=None, *, enqueue=False, on_error=None, on_cleanup=None):
         """
         Executes sequence for a slot:
         1. First bell (if enabled)
@@ -162,18 +190,16 @@ class AudioPlayer:
         if slot_data.get("sound_con"):
             if voice_lang in ("thai", "both") and slot_data.get("sound_data"):
                 f = self.get_sound_path("Thai", "ConTN", slot_data["sound_data"])
-                if os.path.exists(f):
-                    seq.append(f)
+                seq.append(f)
             if voice_lang in ("eng", "both") and slot_data.get("sound_data_eng"):
                 f = self.get_sound_path("Eng", "ConTN", slot_data["sound_data_eng"])
-                if os.path.exists(f):
-                    seq.append(f)
+                seq.append(f)
 
         # 4. Last bell
         if slot_data.get("sound_last"):
             seq.append(self.get_sound_path("Bell", bell_pack, "Last.wav"))
 
-        self.play_sequence_async(seq, on_finish)
+        return self.play_sequence_async(seq, on_finish, enqueue=enqueue, on_error=on_error, on_cleanup=on_cleanup)
 
     def test_single_file(self, full_or_rel_path, on_finish=None):
         if not os.path.isabs(full_or_rel_path):

@@ -7,12 +7,12 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[('nvdaControllerClient64.dll', '.')],
-    datas=[('icon.ico', '.'), ('logo.png', '.'), ('icon.png', '.')],
-    hiddenimports=['qrcode', 'PIL', 'sqlite3', 'winsound'],
+    datas=[('icon.ico', '.'), ('logo.png', '.'), ('icon.png', '.'), ('Sound', 'Sound')],
+    hiddenimports=['qrcode', 'PIL', 'sqlite3', 'winsound', 'cryptography.x509', 'updater'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['numpy', 'matplotlib', 'pygame', 'pandas', 'pytest', 'IPython', 'clr', 'pythonnet'],
     noarchive=False,
     optimize=0,
 )
@@ -50,17 +50,10 @@ exe_dst = os.path.join(dist_dir, 'SmartSchoolChime.exe')
 if os.path.exists(exe_src):
     shutil.copy2(exe_src, exe_dst)
 
-# Copy required folders into dist/SmartSchoolChime: Config, data, Sound
-for folder in ['Config', 'data', 'Sound']:
-    src_folder = os.path.join(SPECPATH, folder)
-    dst_folder = os.path.join(dist_dir, folder)
-    if os.path.exists(src_folder):
-        if os.path.exists(dst_folder):
-            shutil.rmtree(dst_folder)
-        shutil.copytree(src_folder, dst_folder)
+# Sound is embedded. Never package live databases, private keys or user settings.
 
 # Copy necessary support files
-for file_name in ['icon.ico', 'logo.png', 'icon.png', 'nvdaControllerClient64.dll', 'README.md', 'LICENSE', 'run.bat']:
+for file_name in ['icon.ico', 'README.md', 'LICENSE']:
     src_file = os.path.join(SPECPATH, file_name)
     dst_file = os.path.join(dist_dir, file_name)
     if os.path.exists(src_file):

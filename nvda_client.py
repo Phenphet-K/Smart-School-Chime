@@ -35,15 +35,6 @@ class NVDAClient:
             "nvdaControllerClient32.dll"
         ]
 
-        # 1. Try loading directly from system PATH
-        for name in dll_names:
-            try:
-                self._dll = ctypes.windll.LoadLibrary(name)
-                self._is_available = True
-                return
-            except Exception:
-                continue
-
         # 2. Try known directory paths
         for p_dir in possible_dirs:
             if not os.path.exists(p_dir):
@@ -53,6 +44,15 @@ class NVDAClient:
                 if os.path.exists(candidate):
                     try:
                         self._dll = ctypes.windll.LoadLibrary(candidate)
+                        for name, arguments in {
+                            'nvdaController_testIfRunning': [],
+                            'nvdaController_cancelSpeech': [],
+                            'nvdaController_speakText': [ctypes.c_wchar_p],
+                            'nvdaController_brailleMessage': [ctypes.c_wchar_p],
+                        }.items():
+                            function = getattr(self._dll, name)
+                            function.argtypes = arguments
+                            function.restype = ctypes.c_int
                         self._is_available = True
                         return
                     except Exception:

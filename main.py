@@ -5,19 +5,24 @@ Features:
 - Full widescreen layout (100% width, no wasted blank space on right)
 - High readability, large eye-friendly fonts (11-12pt) and comfortable padding
 - Mobile Push-to-Talk Announcement via QR Code / LAN URL
-- Noise Suppression & 0.1s Pre-roll Delay Buffer
+- Authenticated record-and-send announcements with serialized audio playback
 - Silent background NVDA screen reader compatibility
 """
 
 import os
 import sys
-import time
+from pathlib import Path
 import datetime
-import threading
 import subprocess
 import json
 import webbrowser
-import winsound
+import queue
+import logging
+import threading
+from logging.handlers import RotatingFileHandler
+import app_paths
+from scheduler import MinuteScheduler
+import updater
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -63,7 +68,7 @@ class SmartSchoolChimeApp(tk.Tk):
         self.base_dir = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
         self.title(APP_TITLE)
         self._set_window_icon()
-        
+
         # Maximize window by default (ขยายเต็มจอเป็นค่าเริ่มต้น)
         self.geometry("1300x850")
         self.minsize(1100, 700)
@@ -77,7 +82,20 @@ class SmartSchoolChimeApp(tk.Tk):
         self.option_add("*TCombobox*Listbox.selectBackground", "#2563eb")
         self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
 
-        # Initialize Database & Audio Player
+        # Runtime writes belong outside the onefile extraction directory.
+        app_paths.initialize_storage()
+        log_dir = app_paths.STATE_DIR / 'logs'
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(log_dir / 'chime.log', maxBytes=2_000_000, backupCount=3, encoding='utf-8')
+        handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
+        logging.getLogger().addHandler(handler)
+        self._log_handler = handler
+        logging.getLogger().setLevel(logging.INFO)
+        self._ui_queue = queue.Queue(maxsize=128)
+        self._audio_generation = 0
+        self._minute_scheduler = MinuteScheduler()
+        self._scheduler_after = None
+        self._queue_after = None
         database.init_db()
         self.player = AudioPlayer()
 
@@ -104,8 +122,8 @@ class SmartSchoolChimeApp(tk.Tk):
 
         # Start Wireless LAN Live Broadcast Web Server
         self.broadcast_server = BroadcastServer(
-            http_port=5000, 
-            https_port=5443, 
+            http_port=5000,
+            https_port=5443,
             on_broadcast_received=self.handle_incoming_broadcast
         )
         self.broadcast_server.start()
@@ -123,18 +141,21 @@ class SmartSchoolChimeApp(tk.Tk):
         # Load initial schedule
         self.load_schedule_for_day(self.current_day_id, announce=False)
 
-        # Start Scheduler Background Thread
-        self.scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
-        self.scheduler_thread.start()
+        # Tk variables and widgets are only accessed on the UI thread.
+        self._queue_after = self.after(50, self._drain_ui_queue)
+        self._scheduler_after = self.after(100, self._scheduler_loop)
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # Background speech announcement for screen reader users
-        self.after(600, self._initial_announce)
+        self._initial_after = self.after(600, self._initial_announce)
+
+        # Background auto-check for updates from GitHub Releases
+        self._update_check_after = self.after(4000, self._check_update_background)
 
     def _initial_announce(self):
         urls = self.broadcast_server.get_urls()
-        msg = f"ยินดีต้อนรับสู่ {APP_TITLE} ระบบประกาศสดทางมือถือพร้อมใช้งานที่ {urls['https']} กด F1 เพื่อฟังคู่มือคีย์ลัด"
+        msg = f"ยินดีต้อนรับสู่ {APP_TITLE} สแกน QR Code ในหน้าประกาศเพื่อจับคู่มือถือ กด F1 เพื่อฟังคู่มือคีย์ลัด"
         nvda.speak(msg)
         self.set_log("เปิดโปรแกรมสำเร็จ หน้าจอขยายเต็มจอพร้อมใช้งาน")
 
@@ -222,19 +243,19 @@ class SmartSchoolChimeApp(tk.Tk):
         menu_days = tk.Menu(menubar, tearoff=0)
         for day_id, label, color, shortcut in DAYS_MAP:
             menu_days.add_command(
-                label=f"{label}  ({shortcut})", 
+                label=f"{label}  ({shortcut})",
                 command=lambda d=day_id: self.select_day(d)
             )
         menubar.add_cascade(label="📅 เลือกวัน (Days)", menu=menu_days, underline=0)
 
-        # 3. Menu ประกาศสด (Live Broadcast)
+        # 3. Menu ประกาศ (Live Broadcast)
         menu_broadcast = tk.Menu(menubar, tearoff=0)
-        menu_broadcast.add_command(label="📢 เปิดหน้า QR Code ประกาศสดทางมือถือ (Ctrl+B)", command=lambda: self.notebook.select(1), accelerator="Ctrl+B")
+        menu_broadcast.add_command(label="📢 เปิดหน้า QR Code ประกาศทางมือถือ (Ctrl+B)", command=lambda: self.notebook.select(1), accelerator="Ctrl+B")
         menu_broadcast.add_command(label="🌐 เปิดหน้าเว็บพูดประกาศในเบราว์เซอร์", command=self.open_web_broadcast)
         menu_broadcast.add_command(label="📋 คัดลอก URL หน้าพูดประกาศ", command=self.copy_broadcast_url)
         menu_broadcast.add_separator()
         menu_broadcast.add_command(label="⏹️ ตัดเสียงประกาศทันที (Esc)", command=self.stop_audio, accelerator="Esc")
-        menubar.add_cascade(label="📢 ประกาศสด (Broadcast)", menu=menu_broadcast, underline=0)
+        menubar.add_cascade(label="📢 ประกาศ (Broadcast)", menu=menu_broadcast, underline=0)
 
         # 4. Menu เสียง (Audio)
         menu_audio = tk.Menu(menubar, tearoff=0)
@@ -252,6 +273,7 @@ class SmartSchoolChimeApp(tk.Tk):
         menu_settings.add_separator()
         menu_settings.add_command(label="🔔 โหมดตารางเดียวกันทุกวัน (All Days)", command=lambda: self._set_mode_via_menu("all_day"))
         menu_settings.add_command(label="📅 โหมดแยกตารางตามวัน (Each Day)", command=lambda: self._set_mode_via_menu("each_day"))
+        menu_settings.add_command(label='ยกเลิกการปิดเครื่องอัตโนมัติ', command=self.cancel_shutdown)
         menubar.add_cascade(label="⚙️ ตั้งค่า (Settings)", menu=menu_settings, underline=0)
 
         # 6. Menu ช่วยเหลือ (Help)
@@ -259,6 +281,7 @@ class SmartSchoolChimeApp(tk.Tk):
         menu_help.add_command(label="📢 อ่านสรุปเวลาและเสียงถัดไป (F5)", command=self.speak_summary_nvda, accelerator="F5")
         menu_help.add_command(label="⌨️ คู่มือคีย์ลัดการใช้งาน (F1)", command=self.show_nvda_help, accelerator="F1")
         menu_help.add_separator()
+        menu_help.add_command(label="🔄 ตรวจสอบการอัปเดต...", command=self.check_updates_interactive)
         menu_help.add_command(label="ℹ️ เกี่ยวกับ Smart School Chime", command=self.show_about_dialog)
         menubar.add_cascade(label="❓ ช่วยเหลือ (Help)", menu=menu_help, underline=0)
 
@@ -300,27 +323,27 @@ class SmartSchoolChimeApp(tk.Tk):
 
         header_title_text = "Smart School Chime" if has_logo_img else "🔔 Smart School Chime"
         title = ttk.Label(
-            title_row, 
-            text=header_title_text, 
-            font=("Segoe UI", 20, "bold"), 
-            foreground="#ffffff", 
+            title_row,
+            text=header_title_text,
+            font=("Segoe UI", 20, "bold"),
+            foreground="#ffffff",
             background="#1e293b"
         )
         title.pack(side=tk.LEFT, anchor="w")
 
         # Subtitle without any "Universal Accessibility Edition" text
         subtitle = ttk.Label(
-            left_box, 
-            text="ระบบเสียงสัญญาณเตือนเวลาและประกาศโรงเรียนอัตโนมัติ", 
-            font=("Segoe UI", 11), 
-            foreground="#94a3b8", 
+            left_box,
+            text="ระบบเสียงสัญญาณเตือนเวลาและประกาศโรงเรียนอัตโนมัติ",
+            font=("Segoe UI", 11),
+            foreground="#94a3b8",
             background="#1e293b"
         )
         subtitle.pack(anchor="w", pady=(2, 4))
 
         self.lbl_next_event = ttk.Label(
-            left_box, 
-            text="⏳ เสียงถัดไป: กำลังคำนวณ...", 
+            left_box,
+            text="⏳ เสียงถัดไป: กำลังคำนวณ...",
             style="NextEvent.TLabel"
         )
         self.lbl_next_event.pack(anchor="w", pady=(2, 0))
@@ -345,7 +368,7 @@ class SmartSchoolChimeApp(tk.Tk):
 
         # Tab 2: Live Mobile Broadcast (QR Code & LAN URL)
         self.tab_broadcast = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_broadcast, text="  📢 ประกาศสดผ่านมือถือ (Live Broadcast)  ")
+        self.notebook.add(self.tab_broadcast, text="  📢 ประกาศผ่านมือถือ (Live Broadcast)  ")
         self._build_broadcast_tab()
 
         # Tab 3: Settings
@@ -359,10 +382,10 @@ class SmartSchoolChimeApp(tk.Tk):
         day_bar.pack(fill=tk.X, padx=2, pady=4)
 
         lbl_day = tk.Label(
-            day_bar, 
-            text="📅 เลือกวัน:", 
-            font=("Segoe UI", 11, "bold"), 
-            bg="#e2e8f0", 
+            day_bar,
+            text="📅 เลือกวัน:",
+            font=("Segoe UI", 11, "bold"),
+            bg="#e2e8f0",
             fg="#1e293b"
         )
         lbl_day.pack(side=tk.LEFT, padx=(4, 10))
@@ -370,8 +393,8 @@ class SmartSchoolChimeApp(tk.Tk):
         self.day_buttons = {}
         for day_id, label, color, shortcut in DAYS_MAP:
             btn = tk.Button(
-                day_bar, 
-                text=label, 
+                day_bar,
+                text=label,
                 font=("Segoe UI", 10, "bold"),
                 bg="#ffffff",
                 fg="#334155",
@@ -454,10 +477,10 @@ class SmartSchoolChimeApp(tk.Tk):
         ]
         for col_idx, name, anc in cols:
             lbl = tk.Label(
-                header_frame, 
-                text=name, 
-                font=("Segoe UI", 11, "bold"), 
-                bg="#e2e8f0", 
+                header_frame,
+                text=name,
+                font=("Segoe UI", 11, "bold"),
+                bg="#e2e8f0",
                 fg="#1e293b",
                 anchor=anc,
                 padx=6,
@@ -475,11 +498,11 @@ class SmartSchoolChimeApp(tk.Tk):
 
             # Col 0: Slot number badge
             lbl_slot = tk.Label(
-                row, 
-                text=f"คาบ {i:02d}", 
-                font=("Segoe UI", 11, "bold"), 
-                bg="#e0e7ff" if i <= 14 else "#f1f5f9", 
-                fg="#1e3a8a" if i <= 14 else "#64748b", 
+                row,
+                text=f"คาบ {i:02d}",
+                font=("Segoe UI", 11, "bold"),
+                bg="#e0e7ff" if i <= 14 else "#f1f5f9",
+                fg="#1e3a8a" if i <= 14 else "#64748b",
                 anchor="center",
                 relief="flat",
                 padx=4,
@@ -542,16 +565,16 @@ class SmartSchoolChimeApp(tk.Tk):
 
             # Col 8: Test Play Button
             btn_test = tk.Button(
-                row, 
-                text="▶ ฟัง", 
-                font=("Segoe UI", 9, "bold"), 
-                bg="#e0f2fe", 
+                row,
+                text="▶ ฟัง",
+                font=("Segoe UI", 9, "bold"),
+                bg="#e0f2fe",
                 fg="#0369a1",
                 activebackground="#0284c7",
                 activeforeground="#ffffff",
                 relief="flat",
                 bd=1,
-                padx=8, 
+                padx=8,
                 pady=2,
                 cursor="hand2",
                 command=lambda s_idx=i: self.test_slot(s_idx)
@@ -578,16 +601,16 @@ class SmartSchoolChimeApp(tk.Tk):
         bottom_bar.pack(fill=tk.X, side=tk.BOTTOM)
 
         btn_save = tk.Button(
-            bottom_bar, 
-            text="💾 บันทึกตารางเวลานี้ (Ctrl+S)", 
-            font=("Segoe UI", 11, "bold"), 
-            bg="#059669", 
-            fg="#ffffff", 
+            bottom_bar,
+            text="💾 บันทึกตารางเวลานี้ (Ctrl+S)",
+            font=("Segoe UI", 11, "bold"),
+            bg="#059669",
+            fg="#ffffff",
             activebackground="#047857",
             activeforeground="#ffffff",
             relief="flat",
             bd=0,
-            padx=18, 
+            padx=18,
             pady=8,
             cursor="hand2",
             command=self.save_current_day_schedule
@@ -596,16 +619,16 @@ class SmartSchoolChimeApp(tk.Tk):
         btn_save.bind("<FocusIn>", lambda e: self.announce("ปุ่มบันทึกตารางเวลานี้ คีย์ลัด Ctrl+S"))
 
         btn_copy = tk.Button(
-            bottom_bar, 
-            text="📋 นำตารางนี้ไปใช้กับทุกวัน", 
-            font=("Segoe UI", 11, "bold"), 
-            bg="#2563eb", 
-            fg="#ffffff", 
+            bottom_bar,
+            text="📋 นำตารางนี้ไปใช้กับทุกวัน",
+            font=("Segoe UI", 11, "bold"),
+            bg="#2563eb",
+            fg="#ffffff",
             activebackground="#1d4ed8",
             activeforeground="#ffffff",
             relief="flat",
             bd=0,
-            padx=16, 
+            padx=16,
             pady=8,
             cursor="hand2",
             command=self.copy_current_to_all_days
@@ -615,7 +638,7 @@ class SmartSchoolChimeApp(tk.Tk):
 
         btn_goto_bc = tk.Button(
             bottom_bar,
-            text="📢 ประกาศสดผ่านมือถือ / QR Code (Ctrl+B)",
+            text="📢 ประกาศผ่านมือถือ / QR Code (Ctrl+B)",
             font=("Segoe UI", 11, "bold"),
             bg="#0284c7",
             fg="#ffffff",
@@ -629,19 +652,19 @@ class SmartSchoolChimeApp(tk.Tk):
             command=lambda: self.notebook.select(1)
         )
         btn_goto_bc.pack(side=tk.LEFT, padx=6)
-        btn_goto_bc.bind("<FocusIn>", lambda e: self.announce("ปุ่มเปิดหน้า QR Code ประกาศสดทางมือถือ คีย์ลัด Ctrl+B"))
+        btn_goto_bc.bind("<FocusIn>", lambda e: self.announce("ปุ่มเปิดหน้า QR Code ประกาศทางมือถือ คีย์ลัด Ctrl+B"))
 
         btn_stop = tk.Button(
-            bottom_bar, 
-            text="⏹️ หยุดเสียงทันที (Esc)", 
-            font=("Segoe UI", 11, "bold"), 
-            bg="#dc2626", 
-            fg="#ffffff", 
+            bottom_bar,
+            text="⏹️ หยุดเสียงทันที (Esc)",
+            font=("Segoe UI", 11, "bold"),
+            bg="#dc2626",
+            fg="#ffffff",
             activebackground="#b91c1c",
             activeforeground="#ffffff",
             relief="flat",
             bd=0,
-            padx=18, 
+            padx=18,
             pady=8,
             cursor="hand2",
             command=self.stop_audio
@@ -691,14 +714,14 @@ class SmartSchoolChimeApp(tk.Tk):
 
         # Left Column: QR Code Display Card
         left_card = tk.LabelFrame(
-            main_box, 
-            text=" 📱 สแกน QR Code ด้วยมือถือเพื่อพูดประกาศ ", 
-            font=("Segoe UI", 12, "bold"), 
-            bg="#ffffff", 
-            fg="#1e293b", 
-            padx=20, 
-            pady=18, 
-            bd=1, 
+            main_box,
+            text=" 📱 สแกน QR Code ด้วยมือถือเพื่อพูดประกาศ ",
+            font=("Segoe UI", 12, "bold"),
+            bg="#ffffff",
+            fg="#1e293b",
+            padx=20,
+            pady=18,
+            bd=1,
             relief="solid"
         )
         left_card.pack(side=tk.LEFT, fill=tk.BOTH, padx=(0, 20), pady=4)
@@ -725,11 +748,11 @@ class SmartSchoolChimeApp(tk.Tk):
             tk.Label(fallback_box, text="(คัดลอกหรือเปิดจากแถบด้านขวาได้ทันที)", font=("Segoe UI", 10), bg="#f1f5f9", fg="#64748b").pack(pady=2)
 
         lbl_scan_hint = tk.Label(
-            left_card, 
-            text="สแกนด้วยกล้องมือถือที่ต่อ Wi-Fi เดียวกัน\nกดปุ่มค้างเพื่อพูดกระจายเสียงสดได้ทันที", 
-            font=("Segoe UI", 11, "bold"), 
-            bg="#ffffff", 
-            fg="#2563eb", 
+            left_card,
+            text="สแกนด้วยกล้องมือถือที่ต่อ Wi-Fi เดียวกัน\nกดค้างเพื่ออัดเสียง ปล่อยเพื่อส่งประกาศ",
+            font=("Segoe UI", 11, "bold"),
+            bg="#ffffff",
+            fg="#2563eb",
             justify="center"
         )
         lbl_scan_hint.pack(anchor="center", pady=(2, 6))
@@ -740,14 +763,14 @@ class SmartSchoolChimeApp(tk.Tk):
 
         # 1. Connection Card
         conn_card = tk.LabelFrame(
-            right_box, 
-            text=" 🌐 ที่อยู่เว็บไซต์สำหรับเข้าผ่านเบราว์เซอร์ในวง LAN เดียวกัน ", 
-            font=("Segoe UI", 12, "bold"), 
-            bg="#ffffff", 
-            fg="#1e293b", 
-            padx=18, 
-            pady=14, 
-            bd=1, 
+            right_box,
+            text=" 🌐 ที่อยู่เว็บไซต์สำหรับเข้าผ่านเบราว์เซอร์ในวง LAN เดียวกัน ",
+            font=("Segoe UI", 12, "bold"),
+            bg="#ffffff",
+            fg="#1e293b",
+            padx=18,
+            pady=14,
+            bd=1,
             relief="solid"
         )
         conn_card.pack(fill=tk.X, pady=(0, 16))
@@ -784,10 +807,10 @@ class SmartSchoolChimeApp(tk.Tk):
         feat_card = tk.Frame(conn_card, bg="#ffffff")
         feat_card.pack(fill=tk.X, pady=(12, 4))
 
-        lbl_f1 = tk.Label(feat_card, text="🛡️ ตัดเสียงรบกวน (Noise Suppression): เปิด", font=("Segoe UI", 10, "bold"), bg="#ecfdf5", fg="#047857", padx=10, pady=4, relief="solid", bd=1)
+        lbl_f1 = tk.Label(feat_card, text="🛡️ ลดเสียงรบกวนตามความสามารถของมือถือ", font=("Segoe UI", 10, "bold"), bg="#ecfdf5", fg="#047857", padx=10, pady=4, relief="solid", bd=1)
         lbl_f1.pack(side=tk.LEFT, padx=(0, 8))
 
-        lbl_f2 = tk.Label(feat_card, text="⏱️ หน่วงเวลาเริ่มพูด 0.1 วินาที (Pre-roll Buffer): เปิด", font=("Segoe UI", 10, "bold"), bg="#eff6ff", fg="#1d4ed8", padx=10, pady=4, relief="solid", bd=1)
+        lbl_f2 = tk.Label(feat_card, text="⏱️ อัดแล้วส่งเมื่อปล่อยปุ่ม (ไม่ใช่ถ่ายทอดสด)", font=("Segoe UI", 10, "bold"), bg="#eff6ff", fg="#1d4ed8", padx=10, pady=4, relief="solid", bd=1)
         lbl_f2.pack(side=tk.LEFT, padx=8)
 
         lbl_f3 = tk.Label(feat_card, text="🎙️ กดค้างเพื่อพูด (Push-to-Talk): เปิด", font=("Segoe UI", 10, "bold"), bg="#fef3c7", fg="#b45309", padx=10, pady=4, relief="solid", bd=1)
@@ -795,27 +818,27 @@ class SmartSchoolChimeApp(tk.Tk):
 
         # 3. Live Broadcast Log and Emergency Controls
         log_card = tk.LabelFrame(
-            right_box, 
-            text=" 📋 ประวัติการพูดประกาศสดผ่านระบบไมโครโฟนไร้สาย ", 
-            font=("Segoe UI", 12, "bold"), 
-            bg="#ffffff", 
-            fg="#1e293b", 
-            padx=16, 
-            pady=12, 
-            bd=1, 
+            right_box,
+            text=" 📋 ประวัติการพูดประกาศผ่านระบบไมโครโฟนไร้สาย ",
+            font=("Segoe UI", 12, "bold"),
+            bg="#ffffff",
+            fg="#1e293b",
+            padx=16,
+            pady=12,
+            bd=1,
             relief="solid"
         )
         log_card.pack(fill=tk.BOTH, expand=True)
 
         log_scroll = ttk.Scrollbar(log_card, orient=tk.VERTICAL)
         self.broadcast_listbox = tk.Listbox(
-            log_card, 
-            font=("Segoe UI", 10), 
-            bg="#f8fafc", 
-            fg="#0f172a", 
-            selectbackground="#2563eb", 
+            log_card,
+            font=("Segoe UI", 10),
+            bg="#f8fafc",
+            fg="#0f172a",
+            selectbackground="#2563eb",
             selectforeground="#ffffff",
-            bd=1, 
+            bd=1,
             relief="solid",
             yscrollcommand=log_scroll.set
         )
@@ -823,7 +846,8 @@ class SmartSchoolChimeApp(tk.Tk):
         self.broadcast_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self.broadcast_listbox.insert(tk.END, "🟢 ระบบประกาศสดออนไลน์ พร้อมรับสัญญาณเสียงจากสมาร์ตโฟนในวง Wi-Fi")
+        status = 'พร้อมรับเสียงประกาศ (อัดแล้วส่ง)' if self.broadcast_server.httpsd else 'HTTPS เปิดไม่สำเร็จ: ตรวจพอร์ตและบันทึกระบบ'
+        self.broadcast_listbox.insert(tk.END, status)
 
         # Bottom Bar of Broadcast Tab
         bc_bottom = tk.Frame(self.tab_broadcast, bg="#e2e8f0", padx=16, pady=12)
@@ -831,7 +855,7 @@ class SmartSchoolChimeApp(tk.Tk):
 
         btn_test_sim = tk.Button(
             bc_bottom,
-            text="▶️ ทดสอบเปิดหน้าพูดประกาศสดในคอม",
+            text="▶️ ทดสอบเปิดหน้าพูดประกาศในคอม",
             font=("Segoe UI", 11),
             bg="#2563eb",
             fg="#ffffff",
@@ -862,6 +886,19 @@ class SmartSchoolChimeApp(tk.Tk):
             command=self.stop_audio
         )
         btn_stop_bc.pack(side=tk.RIGHT, padx=4)
+        tk.Button(bc_bottom, text='ออก QR ใหม่ / ยกเลิกสิทธิ์มือถือเดิม',
+                  command=self.refresh_broadcast_pairing).pack(side=tk.LEFT, padx=8)
+
+    def refresh_broadcast_pairing(self):
+        self.broadcast_server.rotate_token()
+        for child in self.tab_broadcast.winfo_children():
+            child.destroy()
+        self._build_broadcast_tab()
+        self.announce('ออก QR ใหม่แล้ว สิทธิ์มือถือเดิมหมดอายุ')
+
+    def report_callback_exception(self, exc_type, exc_value, traceback):
+        logging.getLogger(__name__).error('UI callback failed', exc_info=(exc_type, exc_value, traceback))
+        messagebox.showerror('ทำรายการไม่สำเร็จ', str(exc_value))
 
     def _copy_to_clipboard(self, text):
         self.clipboard_clear()
@@ -878,38 +915,59 @@ class SmartSchoolChimeApp(tk.Tk):
         webbrowser.open(urls["https"])
         self.announce("เปิดหน้าเว็บพูดประกาศในเบราว์เซอร์แล้ว")
 
-    def handle_incoming_broadcast(self, client_ip, wav_path, play_chime):
-        now_str = datetime.datetime.now().strftime("%H:%M:%S")
-        log_msg = f"[{now_str}] 🎙️ ได้รับการพูดประกาศสดจากมือถือ (IP: {client_ip})"
-        self.after(0, lambda: self.add_broadcast_log(log_msg))
-        self.after(0, lambda: self.announce(f"มีการพูดประกาศสดผ่านระบบไมโครโฟนไร้สาย จากไอพี {client_ip}"))
+    def post_ui(self, callback):
+        if not self.is_running:
+            return False
+        try:
+            self._ui_queue.put_nowait(callback)
+            return True
+        except queue.Full:
+            logging.getLogger(__name__).error('UI event queue full')
+            return False
 
-        def _play_worker():
-            # 1. 0.1s Pre-roll buffer per user requirement
-            time.sleep(0.1)
-
-            # 2. Optional Pre-announcement Chime
-            if play_chime:
-                self.after(0, lambda: self.set_log(f"🔔 กำลังเล่นเสียงกริ่งเตือนก่อนเริ่มประกาศสด ({client_ip})"))
-                self.player.play_bell(self.bell_pack.get(), "First")
-                time.sleep(1.2)
-
-            # 3. Play the live voice announcement
-            self.after(0, lambda: self.set_log(f"📢 กำลังถ่ายทอดเสียงประกาศสดจาก {client_ip}..."))
+    def _drain_ui_queue(self):
+        for _ in range(32):
             try:
-                winsound.PlaySound(wav_path, winsound.SND_FILENAME)
-            except Exception as e:
-                print("Error playing broadcast audio:", e)
+                callback = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception:
+                logging.getLogger(__name__).exception('UI event failed')
+        if self.is_running:
+            self._queue_after = self.after(50, self._drain_ui_queue)
 
-            self.after(0, lambda: self.set_log(f"✅ สิ้นสุดการถ่ายทอดเสียงประกาศสดจาก {client_ip}"))
-            self.after(0, lambda: self.add_broadcast_log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] ✅ ออกอากาศเสียงประกาศสดสำเร็จ"))
+    def handle_incoming_broadcast(self, client_ip, wav_path, play_chime):
+        generation = self._audio_generation
 
-        t = threading.Thread(target=_play_worker, daemon=True)
-        t.start()
+        def accept():
+            if not self.is_running or generation != self._audio_generation:
+                self.broadcast_server.release_broadcast(wav_path)
+                return
+            self.add_broadcast_log(f'รับเสียงประกาศจาก {client_ip} เข้าคิวแล้ว')
+            files = []
+            if play_chime:
+                files.append(self.player.get_sound_path('Bell', self.bell_pack.get(), 'First.wav'))
+            files.append(wav_path)
+            try:
+                self.player.play_sequence_async(
+                    files, enqueue=True,
+                    on_finish=lambda: self.post_ui(lambda: self.add_broadcast_log(f'เล่นประกาศจาก {client_ip} สำเร็จ')),
+                    on_error=lambda error: self.post_ui(lambda e=str(error): self.add_broadcast_log(f'เล่นประกาศไม่สำเร็จ: {e}')),
+                    on_cleanup=lambda: self.broadcast_server.release_broadcast(wav_path))
+            except Exception:
+                self.broadcast_server.release_broadcast(wav_path)
+                raise
+
+        if not self.post_ui(accept):
+            raise RuntimeError('Application is closing or busy')
 
     def add_broadcast_log(self, text):
         self.broadcast_listbox.insert(tk.END, text)
         self.broadcast_listbox.see(tk.END)
+        if self.broadcast_listbox.size() > 500:
+            self.broadcast_listbox.delete(0, self.broadcast_listbox.size() - 501)
 
     def _build_settings_tab(self):
         frame = tk.Frame(self.tab_settings, bg="#f8fafc", padx=30, pady=20)
@@ -917,12 +975,12 @@ class SmartSchoolChimeApp(tk.Tk):
 
         # 1. Operation Mode
         grp_mode = tk.LabelFrame(
-            frame, 
-            text=" ⚙️ โหมดการใช้งานตารางเวลา (Schedule Mode) ", 
-            font=("Segoe UI", 11, "bold"), 
-            bg="#ffffff", 
-            fg="#1e293b", 
-            padx=18, 
+            frame,
+            text=" ⚙️ โหมดการใช้งานตารางเวลา (Schedule Mode) ",
+            font=("Segoe UI", 11, "bold"),
+            bg="#ffffff",
+            fg="#1e293b",
+            padx=18,
             pady=14,
             bd=1,
             relief="solid"
@@ -930,10 +988,10 @@ class SmartSchoolChimeApp(tk.Tk):
         grp_mode.pack(fill=tk.X, pady=(0, 16))
 
         rb_all = tk.Radiobutton(
-            grp_mode, 
-            text="🌟 ใช้ตารางเวลาเดียวกันทุกวัน (All Days Mode) — สะดวก และใช้ได้ทันที", 
+            grp_mode,
+            text="🌟 ใช้ตารางเวลาเดียวกันทุกวัน (All Days Mode) — สะดวก และใช้ได้ทันที",
             font=("Segoe UI", 11),
-            variable=self.day_mode, 
+            variable=self.day_mode,
             value="all_day",
             bg="#ffffff",
             activebackground="#ffffff",
@@ -943,10 +1001,10 @@ class SmartSchoolChimeApp(tk.Tk):
         rb_all.bind("<FocusIn>", lambda e: self.announce("ตัวเลือกโหมดตารางเวลาเดียวกันทุกวัน"))
 
         rb_each = tk.Radiobutton(
-            grp_mode, 
-            text="📅 แยกตารางเวลาตามวัน (Each Day Mode: จันทร์ - อาทิตย์) — เหมาะกับโรงเรียนที่มีกิจกรรมเฉพาะวัน", 
+            grp_mode,
+            text="📅 แยกตารางเวลาตามวัน (Each Day Mode: จันทร์ - อาทิตย์) — เหมาะกับโรงเรียนที่มีกิจกรรมเฉพาะวัน",
             font=("Segoe UI", 11),
-            variable=self.day_mode, 
+            variable=self.day_mode,
             value="each_day",
             bg="#ffffff",
             activebackground="#ffffff",
@@ -957,12 +1015,12 @@ class SmartSchoolChimeApp(tk.Tk):
 
         # 2. Sound & Voice Settings
         grp_sound = tk.LabelFrame(
-            frame, 
-            text=" 🔊 การตั้งค่าเสียงกริ่งและภาษาบอกเวลา ", 
-            font=("Segoe UI", 11, "bold"), 
-            bg="#ffffff", 
-            fg="#1e293b", 
-            padx=18, 
+            frame,
+            text=" 🔊 การตั้งค่าเสียงกริ่งและภาษาบอกเวลา ",
+            font=("Segoe UI", 11, "bold"),
+            bg="#ffffff",
+            fg="#1e293b",
+            padx=18,
             pady=14,
             bd=1,
             relief="solid"
@@ -1007,12 +1065,12 @@ class SmartSchoolChimeApp(tk.Tk):
 
         # 3. Auto Shutdown
         grp_power = tk.LabelFrame(
-            frame, 
-            text=" 💻 ระบบตั้งเวลาปิดคอมพิวเตอร์อัตโนมัติ (Auto Shutdown) ", 
-            font=("Segoe UI", 11, "bold"), 
-            bg="#ffffff", 
-            fg="#1e293b", 
-            padx=18, 
+            frame,
+            text=" 💻 ระบบตั้งเวลาปิดคอมพิวเตอร์อัตโนมัติ (Auto Shutdown) ",
+            font=("Segoe UI", 11, "bold"),
+            bg="#ffffff",
+            fg="#1e293b",
+            padx=18,
             pady=14,
             bd=1,
             relief="solid"
@@ -1023,8 +1081,8 @@ class SmartSchoolChimeApp(tk.Tk):
         power_row.pack(fill=tk.X, pady=6)
 
         chk_shutdown = tk.Checkbutton(
-            power_row, 
-            text="เปิดใช้งานระบบปิดคอมพิวเตอร์อัตโนมัติเมื่อถึงเวลา:", 
+            power_row,
+            text="เปิดใช้งานระบบปิดคอมพิวเตอร์อัตโนมัติเมื่อถึงเวลา:",
             font=("Segoe UI", 11),
             variable=self.auto_shutdown,
             bg="#ffffff"
@@ -1046,12 +1104,12 @@ class SmartSchoolChimeApp(tk.Tk):
 
         # 4. Backup & Restore
         grp_data = tk.LabelFrame(
-            frame, 
-            text=" 💾 สำรองและนำเข้าข้อมูล (Backup / Restore) ", 
-            font=("Segoe UI", 11, "bold"), 
-            bg="#ffffff", 
-            fg="#1e293b", 
-            padx=18, 
+            frame,
+            text=" 💾 สำรองและนำเข้าข้อมูล (Backup / Restore) ",
+            font=("Segoe UI", 11, "bold"),
+            bg="#ffffff",
+            fg="#1e293b",
+            padx=18,
             pady=14,
             bd=1,
             relief="solid"
@@ -1070,16 +1128,16 @@ class SmartSchoolChimeApp(tk.Tk):
         btn_imp.bind("<FocusIn>", lambda e: self.announce("ปุ่มนำเข้าไฟล์สำรองข้อมูล JSON"))
 
         btn_save_settings = tk.Button(
-            frame, 
-            text="💾 บันทึกการตั้งค่าระบบทั้งหมด", 
-            font=("Segoe UI", 11, "bold"), 
-            bg="#059669", 
-            fg="#ffffff", 
+            frame,
+            text="💾 บันทึกการตั้งค่าระบบทั้งหมด",
+            font=("Segoe UI", 11, "bold"),
+            bg="#059669",
+            fg="#ffffff",
             activebackground="#047857",
             activeforeground="#ffffff",
             relief="flat",
             bd=0,
-            padx=22, 
+            padx=22,
             pady=9,
             cursor="hand2",
             command=self.save_settings
@@ -1093,10 +1151,10 @@ class SmartSchoolChimeApp(tk.Tk):
         statusbar.pack(fill=tk.X, side=tk.BOTTOM)
 
         lbl_status = tk.Label(
-            statusbar, 
-            text="🟢 ระบบเฝ้าตรวจเวลาทำงานปกติ", 
-            font=("Segoe UI", 10, "bold"), 
-            bg="#1e293b", 
+            statusbar,
+            text="🟢 ระบบเฝ้าตรวจเวลาทำงานปกติ",
+            font=("Segoe UI", 10, "bold"),
+            bg="#1e293b",
             fg="#4ade80"
         )
         lbl_status.pack(side=tk.LEFT, padx=(0, 14))
@@ -1104,7 +1162,7 @@ class SmartSchoolChimeApp(tk.Tk):
         # Broadcast Status Badge
         self.lbl_bc_badge = tk.Label(
             statusbar,
-            text=f"📡 ประกาศสด: {self.broadcast_server.lan_ip}:5443",
+            text=f"📡 ประกาศ: {self.broadcast_server.lan_ip}:5443",
             font=("Segoe UI", 10, "bold"),
             bg="#1e293b",
             fg="#facc15"
@@ -1112,19 +1170,19 @@ class SmartSchoolChimeApp(tk.Tk):
         self.lbl_bc_badge.pack(side=tk.LEFT, padx=10)
 
         self.lbl_accessibility = tk.Label(
-            statusbar, 
-            textvariable=self.accessible_status, 
-            font=("Segoe UI", 10), 
-            bg="#1e293b", 
+            statusbar,
+            textvariable=self.accessible_status,
+            font=("Segoe UI", 10),
+            bg="#1e293b",
             fg="#f1f5f9"
         )
         self.lbl_accessibility.pack(side=tk.LEFT, padx=12)
 
         self.lbl_log = tk.Label(
-            statusbar, 
-            text="พร้อมใช้งาน", 
-            font=("Segoe UI", 10), 
-            bg="#1e293b", 
+            statusbar,
+            text="พร้อมใช้งาน",
+            font=("Segoe UI", 10),
+            bg="#1e293b",
             fg="#cbd5e1"
         )
         self.lbl_log.pack(side=tk.RIGHT)
@@ -1175,7 +1233,7 @@ class SmartSchoolChimeApp(tk.Tk):
                 w = self.slot_widgets[num - 1]
                 w["hour"].set(str(s_data.get("hour", "00")).zfill(2))
                 w["minute"].set(str(s_data.get("minute", "00")).zfill(2))
-                
+
                 sf = bool(s_data.get("sound_first"))
                 st = bool(s_data.get("sound_time"))
                 sc = bool(s_data.get("sound_con"))
@@ -1218,7 +1276,12 @@ class SmartSchoolChimeApp(tk.Tk):
                 "sound_data_eng": "" if eng_file == "(None)" else eng_file,
                 "sound_last": 1 if w["sound_last"].get() else 0
             })
-        database.save_all_day_slots(day_id, slots_list)
+        try:
+            database.save_all_day_slots(day_id, slots_list)
+        except (ValueError, OSError, database.sqlite3.Error) as error:
+            messagebox.showerror('บันทึกไม่สำเร็จ', str(error))
+            return
+        self._refresh_next_event()
         day_name = [d[1] for d in DAYS_MAP if d[0] == day_id][0]
         self.announce(f"บันทึกตารางเวลา '{day_name}' เรียบร้อยแล้ว")
         messagebox.showinfo("บันทึกสำเร็จ", f"บันทึกตารางเวลา '{day_name}' เรียบร้อยแล้ว")
@@ -1229,6 +1292,7 @@ class SmartSchoolChimeApp(tk.Tk):
         if not messagebox.askyesno("ยืนยัน", f"คุณต้องการนำตารางเวลาจาก '{day_name}' ไปทับทุกวัน (จันทร์-อาทิตย์ และ All Day) หรือไม่?"):
             return
         database.copy_day_to_all_days(self.current_day_id)
+        self._refresh_next_event()
         self.announce("นำตารางเวลานี้ไปใช้กับทุกวันเรียบร้อยแล้ว")
         messagebox.showinfo("สำเร็จ", "คัดลอกตารางเวลาไปยังทุกวันเรียบร้อยแล้ว!")
         self.set_log("คัดลอกตารางเวลาไปยังทุกวันสำเร็จ")
@@ -1237,6 +1301,7 @@ class SmartSchoolChimeApp(tk.Tk):
         if messagebox.askyesno("ยืนยัน", "คุณต้องการรีเซ็ตตารางเวลากลับเป็น 'ตารางมาตรฐานโรงเรียน' (14 คาบเรียนครบชุด) หรือไม่?"):
             database.reset_to_default_schedule()
             self.load_schedule_for_day(self.current_day_id, announce=False)
+            self._refresh_next_event()
             self.announce("คืนค่าตารางเวลามาตรฐานโรงเรียน 14 คาบเรียนเรียบร้อยแล้ว")
             messagebox.showinfo("สำเร็จ", "คืนค่าตารางเวลามาตรฐานโรงเรียนเรียบร้อยแล้ว")
             self.set_log("คืนค่าตารางเวลามาตรฐานโรงเรียนสำเร็จ")
@@ -1265,10 +1330,10 @@ class SmartSchoolChimeApp(tk.Tk):
         self.set_log(f"กำลังทดสอบเสียง: {desc}")
 
         self.player.play_slot_event(
-            slot_data, 
-            bell_pack=self.bell_pack.get(), 
+            slot_data,
+            bell_pack=self.bell_pack.get(),
             voice_lang=self.voice_lang.get(),
-            on_finish=lambda: self.set_log(f"ทดสอบเสียง {desc} เสร็จสิ้น")
+            on_finish=lambda: self.post_ui(lambda: self.set_log(f"ทดสอบเสียง {desc} เสร็จสิ้น"))
         )
 
     def test_current_time_voice(self):
@@ -1283,13 +1348,14 @@ class SmartSchoolChimeApp(tk.Tk):
         }
         self.announce(f"ทดสอบขานเวลา {now.hour:02d}:{now.minute:02d} น.")
         self.player.play_slot_event(
-            slot_data, 
-            bell_pack=self.bell_pack.get(), 
+            slot_data,
+            bell_pack=self.bell_pack.get(),
             voice_lang=self.voice_lang.get(),
-            on_finish=lambda: self.set_log("ทดสอบขานเวลาเสร็จสิ้น")
+            on_finish=lambda: self.post_ui(lambda: self.set_log("ทดสอบขานเวลาเสร็จสิ้น"))
         )
 
     def stop_audio(self):
+        self._audio_generation += 1
         self.player.stop()
         self.announce("หยุดเล่นเสียงทั้งหมดแล้ว")
         self.set_log("หยุดเล่นเสียงทั้งหมดแล้ว")
@@ -1297,17 +1363,22 @@ class SmartSchoolChimeApp(tk.Tk):
     def on_mode_change(self):
         database.set_setting("day_mode", self.day_mode.get())
         self.set_log(f"เปลี่ยนโหมดเป็น: {self.day_mode.get()}")
+        self._refresh_next_event()
 
     def save_settings(self):
-        database.set_setting("day_mode", self.day_mode.get())
-        database.set_setting("bell_pack", self.bell_pack.get())
-        database.set_setting("voice_lang", self.voice_lang.get())
-        database.set_setting("auto_shutdown", "1" if self.auto_shutdown.get() else "0")
-        database.set_setting("shutdown_hour", self.shutdown_hour.get())
-        database.set_setting("shutdown_minute", self.shutdown_min.get())
-        self.announce("บันทึกการตั้งค่าระบบเรียบร้อยแล้ว")
-        messagebox.showinfo("บันทึกสำเร็จ", "บันทึกการตั้งค่าระบบเรียบร้อยแล้ว")
-        self.set_log("บันทึกการตั้งค่าระบบสำเร็จ")
+        try:
+            config_manager.save_all_settings({
+                'day_mode': self.day_mode.get(), 'bell_pack': self.bell_pack.get(),
+                'voice_lang': self.voice_lang.get(),
+                'auto_shutdown': '1' if self.auto_shutdown.get() else '0',
+                'shutdown_hour': self.shutdown_hour.get(), 'shutdown_minute': self.shutdown_min.get(),
+            })
+        except (ValueError, OSError) as error:
+            messagebox.showerror('บันทึกไม่สำเร็จ', str(error))
+            return
+        self._refresh_next_event()
+        self.announce('บันทึกการตั้งค่าระบบเรียบร้อยแล้ว')
+        messagebox.showinfo('บันทึกสำเร็จ', 'บันทึกการตั้งค่าระบบเรียบร้อยแล้ว')
 
     def export_backup(self):
         file_path = filedialog.asksaveasfilename(
@@ -1332,6 +1403,14 @@ class SmartSchoolChimeApp(tk.Tk):
             return
         try:
             database.import_from_json(file_path)
+            settings = config_manager.load_all_settings()
+            self.day_mode.set(settings['day_mode'])
+            self.bell_pack.set(settings['bell_pack'])
+            self.voice_lang.set(settings['voice_lang'])
+            self.auto_shutdown.set(settings['auto_shutdown'] == '1')
+            self.shutdown_hour.set(settings['shutdown_hour'])
+            self.shutdown_min.set(settings['shutdown_minute'])
+            self._refresh_next_event()
             self.load_schedule_for_day(self.current_day_id, announce=False)
             self.announce("นำเข้าข้อมูลสำรองเรียบร้อยแล้ว")
             messagebox.showinfo("สำเร็จ", "นำเข้าข้อมูลจากไฟล์สำรองเรียบร้อยแล้ว!")
@@ -1345,7 +1424,7 @@ class SmartSchoolChimeApp(tk.Tk):
         thai_year = now.year + 543
         txt_event = self.lbl_next_event.cget("text")
         urls = self.broadcast_server.get_urls()
-        msg = f"ขณะนี้เวลา {now.hour:02d} นาฬิกา {now.minute:02d} นาที {thai_day}ที่ {now.day} {thai_month} พ.ศ. {thai_year} {txt_event} ระบบประกาศสดทำงานอยู่ที่ {urls['https']}"
+        msg = f"ขณะนี้เวลา {now.hour:02d} นาฬิกา {now.minute:02d} นาที {thai_day}ที่ {now.day} {thai_month} พ.ศ. {thai_year} {txt_event} ระบบประกาศทำงานอยู่ที่ {urls['https']}"
         self.announce(msg)
 
     def test_nvda_connection(self):
@@ -1359,7 +1438,7 @@ class SmartSchoolChimeApp(tk.Tk):
         msg = (
             "📌 คู่มือคีย์ลัดการใช้งานสำหรับแป้นพิมพ์:\n\n"
             "• Alt : เปิดแถบเมนูหลัก\n"
-            "• Ctrl + B : ไปยังหน้าจอ QR Code ประกาศสดทางมือถือทันที\n"
+            "• Ctrl + B : ไปยังหน้าจอ QR Code ประกาศทางมือถือทันที\n"
             "• Alt + 1 ถึง 8 : สลับตารางวัน (Alt+8 ทุกวัน, Alt+2 วันจันทร์ ถึง Alt+1 วันอาทิตย์)\n"
             "• Tab / Shift+Tab : เลื่อนโฟกัสไปตามช่องควบคุม (ระบบจะเลื่อนหน้าจอตามอัตโนมัติ)\n"
             "• Spacebar : ติ๊กเลือก หรือ สลับสถานะกล่องกาเครื่องหมาย\n"
@@ -1378,125 +1457,398 @@ class SmartSchoolChimeApp(tk.Tk):
         urls = self.broadcast_server.get_urls()
         msg = (
             "🔔 Smart School Chime\n"
-            "ระบบเสียงสัญญาณและประกาศเวลาโรงเรียนอัจฉริยะ\n\n"
-            f"• ระบบพูดประกาศสดผ่าน Wi-Fi: {urls['https']}\n"
+            "ระบบเสียงสัญญาณและประกาศเวลาโรงเรียนอัจฉริยะ\n"
+            f"เวอร์ชัน: v{updater.__version__}\n\n"
+            f"• ระบบพูดประกาศผ่าน Wi-Fi: {urls['https']}\n"
             "• ตารางเวลาและเสียงเริ่มต้น 14 คาบเรียนมาตรฐานไทย\n"
-            "• ระบบตัดเสียงรบกวนและหน่วงเวลา 0.1 วินาทีอัตโนมัติ"
+            "• ระบบอัปเดตอัตโนมัติผ่าน GitHub Releases\n"
+            "• อัดเสียงแล้วส่งผ่าน HTTPS พร้อมสิทธิ์จาก QR Code"
         )
         messagebox.showinfo("เกี่ยวกับ Smart School Chime", msg)
+
+    def _check_update_background(self):
+        """Silently query GitHub in background thread after startup."""
+        def worker():
+            try:
+                res = updater.check_for_updates(current_version=updater.__version__)
+                if res.get("has_update"):
+                    self.after(0, lambda: self._prompt_update_available(res, auto=True))
+            except Exception:
+                pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def check_updates_interactive(self):
+        """User-triggered update check from Help menu."""
+        self.set_log("กำลังตรวจสอบการอัปเดตจาก GitHub Releases...")
+        self.announce("กำลังตรวจสอบการอัปเดต...")
+
+        def worker():
+            res = updater.check_for_updates(current_version=updater.__version__)
+            self.after(0, lambda: self._handle_manual_update_result(res))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_manual_update_result(self, res: dict):
+        if res.get("status") == "error":
+            err = res.get("error_message") or "ไม่ทราบสาเหตุ"
+            self.set_log(f"ตรวจสอบการอัปเดตไม่สำเร็จ: {err}")
+            self.announce("ตรวจสอบการอัปเดตไม่สำเร็จ")
+            messagebox.showwarning(
+                "ตรวจสอบการอัปเดต",
+                f"ไม่สามารถตรวจสอบการอัปเดตได้ในขณะนี้:\n{err}\n\nโปรดตรวจสอบการเชื่อมต่ออินเทอร์เน็ต",
+            )
+            return
+
+        if res.get("has_update"):
+            self._prompt_update_available(res, auto=False)
+        else:
+            self.set_log(f"คุณกำลังใช้งานเวอร์ชันล่าสุดแล้ว (v{updater.__version__})")
+            self.announce(f"คุณกำลังใช้งานเวอร์ชันล่าสุดแล้ว เวอร์ชัน {updater.__version__}")
+            messagebox.showinfo(
+                "ตรวจสอบการอัปเดต",
+                f"คุณกำลังใช้งาน Smart School Chime เวอร์ชันล่าสุดแล้ว\n\nเวอร์ชันปัจจุบัน: v{updater.__version__}",
+            )
+
+    def _prompt_update_available(self, info: dict, auto: bool = False):
+        latest_v = info.get("latest_version", "")
+        curr_v = info.get("current_version", updater.__version__)
+        body = info.get("release_notes", "").strip() or "มีการปรับปรุงประสิทธิภาพและการแก้ไขข้อผิดพลาด"
+        asset_name = info.get("asset_name") or "SmartSchoolChime_Setup.exe"
+        size_bytes = info.get("asset_size", 0)
+        size_mb = size_bytes / (1024 * 1024) if size_bytes > 0 else 0
+        size_text = f" ({size_mb:.1f} MB)" if size_mb > 0 else ""
+
+        lines = body.split("\n")
+        if len(lines) > 10:
+            body_preview = "\n".join(lines[:10]) + "\n..."
+        else:
+            body_preview = body
+
+        msg = (
+            f"🔔 พบ Smart School Chime เวอร์ชันใหม่: v{latest_v}\n"
+            f"(เวอร์ชันปัจจุบันของคุณ: v{curr_v})\n\n"
+            f"ไฟล์ติดตั้ง: {asset_name}{size_text}\n\n"
+            f"รายละเอียดการอัปเดต:\n{body_preview}\n\n"
+            f"คุณต้องการดาวน์โหลดและติดตั้งทันทีหรือไม่?"
+        )
+
+        self.set_log(f"พบเวอร์ชันใหม่ v{latest_v} พร้อมให้อัปเดต")
+        self.announce(f"พบเวอร์ชันใหม่ {latest_v} ต้องการอัปเดตหรือไม่")
+
+        confirm = messagebox.askyesno(
+            f"พบการอัปเดตใหม่ v{latest_v}",
+            msg,
+            icon="info",
+        )
+        if confirm:
+            UpdateProgressDialog(self, info)
 
     def set_log(self, text):
         now_str = datetime.datetime.now().strftime("%H:%M:%S")
         self.lbl_log.config(text=f"[{now_str}] {text}")
 
     def _scheduler_loop(self):
-        while self.is_running:
+        if not self.is_running:
+            return
+        try:
             now = datetime.datetime.now()
-            time_str = now.strftime("%H:%M:%S")
-            thai_year = now.year + 543
-            thai_day = THAI_DAYS[now.weekday()]
-            thai_month = THAI_MONTHS[now.month]
-            date_str = f"{thai_day}ที่ {now.day} {thai_month} {thai_year}"
-
+            date_str = f'{THAI_DAYS[now.weekday()]}ที่ {now.day} {THAI_MONTHS[now.month]} {now.year + 543}'
+            self._update_clock_ui(now.strftime('%H:%M:%S'), date_str)
+            previous_check = self._minute_scheduler.last_check
             try:
-                if not self.is_running:
-                    break
-                self.after(0, lambda t=time_str, d=date_str: self._update_clock_ui(t, d))
+                for scheduled in self._minute_scheduler.due(now):
+                    self._check_and_trigger(scheduled)
             except Exception:
-                break
-
-            minute_key = now.strftime("%Y-%m-%d %H:%M")
-            if now.second == 0 and minute_key != self.last_triggered_minute:
+                # Retry transient database failures within the grace period.
+                # Already claimed occurrences remain protected by SQLite.
+                self._minute_scheduler.last_check = previous_check
+                raise
+            minute_key = now.strftime('%Y-%m-%d %H:%M')
+            if minute_key != self.last_triggered_minute:
                 self.last_triggered_minute = minute_key
-                self._check_and_trigger(now)
+                self._refresh_next_event()
+        except Exception:
+            logging.getLogger(__name__).exception('Scheduler tick failed')
+            self.set_log('ระบบเวลาพบข้อผิดพลาด โปรดตรวจบันทึกระบบ')
+        finally:
+            if self.is_running:
+                self._scheduler_after = self.after(250, self._scheduler_loop)
 
-            time.sleep(1)
+    def _target_day(self, now):
+        return 8 if self.day_mode.get() == 'all_day' else (now.weekday() + 1) % 7 + 1
+
+    def _refresh_next_event(self):
+        now = datetime.datetime.now()
+        self._calculate_next_event(self._target_day(now), now)
 
     def _update_clock_ui(self, time_str, date_str):
         self.lbl_clock.config(text=time_str)
         self.lbl_date.config(text=date_str)
 
     def _check_and_trigger(self, now):
-        cur_h = f"{now.hour:02d}"
-        cur_m = f"{now.minute:02d}"
+        target_day = self._target_day(now)
+        cur_h, cur_m = now.strftime('%H'), now.strftime('%M')
+        stamp = now.strftime('%Y-%m-%d %H:%M')
+        slots = database.get_schedules_for_day(target_day)
+        matched = [slot for slot in slots if slot['hour'] == cur_h and slot['minute'] == cur_m
+                   and any(slot.get(flag) for flag in database.FLAGS)]
+        for slot in matched:
+            occurrence = f"{stamp}/slot/{slot['slot_num']}"
+            if not database.claim_event(occurrence):
+                continue
+            desc = f"คาบที่ {slot['slot_num']:02d} ({cur_h}:{cur_m})"
+            self.set_log(f'เข้าคิวเสียงตามตาราง: {desc}')
+            try:
+                self.player.play_slot_event(
+                    slot, self.bell_pack.get(), self.voice_lang.get(), enqueue=True,
+                    on_finish=lambda key=occurrence, d=desc: self.post_ui(lambda: self._finish_scheduled(key, d, 'completed')),
+                    on_error=lambda error, key=occurrence, d=desc: self.post_ui(lambda: self._finish_scheduled(key, d, 'failed')),
+                    on_cleanup=lambda key=occurrence: self.post_ui(lambda: database.finish_event_if_pending(key, 'cancelled')))
+            except Exception:
+                database.finish_event(occurrence, 'failed')
+                raise
+        if (self.auto_shutdown.get() and cur_h == self.shutdown_hour.get().zfill(2)
+                and cur_m == self.shutdown_min.get().zfill(2)):
+            key = f'{stamp}/shutdown'
+            if database.claim_event(key):
+                if self.player.is_playing():
+                    database.finish_event(key, 'skipped_busy')
+                    self.set_log('ข้ามการปิดเครื่อง เพราะมีเสียงกำลังเล่นหรือรอคิว')
+                else:
+                    result = subprocess.run(['shutdown', '/s', '/t', '60', '/c', 'Smart School Chime'],
+                                            capture_output=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                    database.finish_event(key, 'completed' if result.returncode == 0 else 'failed')
+                    self.set_log('กำหนดปิดเครื่องใน 60 วินาที กดยกเลิกได้จากเมนูตั้งค่า')
 
-        # 1. Check Auto Shutdown
-        if self.auto_shutdown.get():
-            sh_h = str(self.shutdown_hour.get()).zfill(2)
-            sh_m = str(self.shutdown_min.get()).zfill(2)
-            if cur_h == sh_h and cur_m == sh_m:
-                self.after(0, lambda: self.announce("ระบบกำลังสั่งปิดคอมพิวเตอร์ตามเวลาที่กำหนด"))
-                try:
-                    subprocess.run(["shutdown", "/s", "/t", "60", "/c", "Smart School Chime: ได้เวลาปิดเครื่องอัตโนมัติ"])
-                except Exception as e:
-                    print("Shutdown error:", e)
-                return
+    def _finish_scheduled(self, occurrence, description, status):
+        database.finish_event(occurrence, status)
+        self.set_log(f'{description}: {status}')
 
-        # 2. Determine Day ID for schedule
-        if self.day_mode.get() == "all_day":
-            target_day_id = 8
-        else:
-            if now.weekday() == 6:  # Sunday
-                target_day_id = 1
-            else:
-                target_day_id = now.weekday() + 2
-
-        slots = database.get_schedules_for_day(target_day_id)
-        for s in slots:
-            slot_h = str(s.get("hour", "00")).zfill(2)
-            slot_m = str(s.get("minute", "00")).zfill(2)
-
-            if slot_h == cur_h and slot_m == cur_m:
-                has_any_sound = s.get("sound_first") or s.get("sound_time") or s.get("sound_con") or s.get("sound_last")
-                if has_any_sound:
-                    slot_num = s.get("slot_num", 1)
-                    desc = f"คาบที่ {slot_num:02d} ({slot_h}:{slot_m} น.)"
-                    self.after(0, lambda d=desc: self.set_log(f"🔔 ถึงเวลาเล่นเสียงตามตาราง: {d}"))
-                    self.player.play_slot_event(
-                        s, 
-                        bell_pack=self.bell_pack.get(), 
-                        voice_lang=self.voice_lang.get(),
-                        on_finish=lambda d=desc: self.after(0, lambda: self.set_log(f"เล่นเสียง {d} เสร็จสิ้น"))
-                    )
-                    break
-
-        self._calculate_next_event(target_day_id, now)
+    def cancel_shutdown(self):
+        result = subprocess.run(['shutdown', '/a'], capture_output=True,
+                                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        self.set_log('ยกเลิกการปิดเครื่องแล้ว' if result.returncode == 0 else 'ไม่มีการปิดเครื่องที่ยกเลิกได้')
 
     def _calculate_next_event(self, target_day_id, now):
-        slots = database.get_schedules_for_day(target_day_id)
-        active_slots = []
-        for s in slots:
-            if s.get("sound_first") or s.get("sound_time") or s.get("sound_con") or s.get("sound_last"):
-                try:
-                    h = int(s.get("hour", 0))
-                    m = int(s.get("minute", 0))
-                    active_slots.append((h, m, s.get("slot_num")))
-                except Exception:
-                    pass
-
-        active_slots.sort()
-        cur_total_min = now.hour * 60 + now.minute
         next_event = None
-        for h, m, slot_num in active_slots:
-            slot_total_min = h * 60 + m
-            if slot_total_min > cur_total_min:
-                diff = slot_total_min - cur_total_min
-                next_event = (h, m, slot_num, diff)
+        for offset in range(8):
+            date = now + datetime.timedelta(days=offset)
+            day = target_day_id if offset == 0 else self._target_day(date)
+            for slot in database.get_schedules_for_day(day):
+                if not any(slot.get(flag) for flag in database.FLAGS):
+                    continue
+                try:
+                    when = date.replace(hour=int(slot['hour']), minute=int(slot['minute']), second=0, microsecond=0)
+                except (ValueError, TypeError):
+                    continue
+                if when > now and (next_event is None or when < next_event[0]):
+                    next_event = (when, slot['slot_num'])
+            if next_event:
                 break
-
         if next_event:
-            h, m, slot_num, diff = next_event
-            txt = f"เสียงถัดไป: {h:02d}:{m:02d} น. (คาบ {slot_num:02d}) อีก {diff} นาที"
+            when, number = next_event
+            minutes = max(1, int((when - now).total_seconds() + 59) // 60)
+            txt = f"เสียงถัดไป: {when:%d/%m %H:%M} (คาบ {number:02d}) อีก {minutes} นาที"
         else:
-            txt = "ไม่มีรายการเสียงที่เหลือในวันนี้แล้ว"
-        self.after(0, lambda: self.lbl_next_event.config(text=f"⏳ {txt}"))
+            txt = 'ไม่มีรายการเสียงใน 7 วันข้างหน้า'
+        self.lbl_next_event.config(text=f'⏳ {txt}')
 
     def on_close(self):
         self.is_running = False
+        self._audio_generation += 1
+        for identifier in (
+            self._scheduler_after,
+            self._queue_after,
+            self._initial_after,
+            getattr(self, '_update_check_after', None),
+        ):
+            if identifier:
+                try:
+                    self.after_cancel(identifier)
+                except Exception:
+                    pass
+        self.player.close()
         self.broadcast_server.stop()
-        self.player.stop()
+        logging.getLogger().removeHandler(self._log_handler)
+        self._log_handler.close()
         self.destroy()
 
-if __name__ == "__main__":
-    app = SmartSchoolChimeApp()
-    app.mainloop()
+
+class UpdateProgressDialog(tk.Toplevel):
+    """Accessible modal dialog displaying download progress for the new update."""
+
+    def __init__(self, parent, update_info: dict):
+        super().__init__(parent)
+        self.parent = parent
+        self.update_info = update_info
+        self.cancel_event = threading.Event()
+        self.title("ดาวน์โหลดการอัปเดต - Smart School Chime")
+        self.geometry("520x240")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self.update_idletasks()
+        try:
+            px = parent.winfo_rootx() + (parent.winfo_width() - 520) // 2
+            py = parent.winfo_rooty() + (parent.winfo_height() - 240) // 2
+            self.geometry(f"+{max(20, px)}+{max(20, py)}")
+        except Exception:
+            pass
+
+        self.protocol("WM_DELETE_WINDOW", self.on_cancel)
+
+        container = ttk.Frame(self, padding="24 20 24 20")
+        container.pack(fill=tk.BOTH, expand=True)
+
+        latest_v = update_info.get("latest_version", "")
+        lbl_head = ttk.Label(
+            container,
+            text=f"🚀 กำลังดาวน์โหลด Smart School Chime v{latest_v}...",
+            font=("Segoe UI", 12, "bold"),
+            foreground="#1e3a8a",
+        )
+        lbl_head.pack(anchor="w", pady=(0, 6))
+
+        asset_name = update_info.get("asset_name", "Setup.exe")
+        lbl_sub = ttk.Label(
+            container,
+            text=f"ไฟล์: {asset_name}",
+            font=("Segoe UI", 9),
+            foreground="#64748b",
+        )
+        lbl_sub.pack(anchor="w", pady=(0, 14))
+
+        self.progress_bar = ttk.Progressbar(container, orient="horizontal", mode="determinate", maximum=100)
+        self.progress_bar.pack(fill=tk.X, pady=(0, 10))
+
+        self.lbl_status = ttk.Label(
+            container,
+            text="กำลังเริ่มการเชื่อมต่อไปยัง GitHub Releases...",
+            font=("Segoe UI", 9),
+            foreground="#334155",
+        )
+        self.lbl_status.pack(anchor="w", pady=(0, 16))
+
+        btn_box = ttk.Frame(container)
+        btn_box.pack(fill=tk.X)
+
+        self.btn_cancel = ttk.Button(btn_box, text="ยกเลิก (Cancel)", command=self.on_cancel)
+        self.btn_cancel.pack(side=tk.RIGHT)
+
+        self._last_nvda_pct = -10
+        self._download_thread = threading.Thread(target=self._run_download, daemon=True)
+        self._download_thread.start()
+
+    def _run_download(self):
+        url = self.update_info.get("download_url")
+        asset_name = self.update_info.get("asset_name") or "SmartSchoolChime_Setup.exe"
+        dest_dir = updater.get_updates_directory()
+        dest_file = dest_dir / asset_name
+
+        def on_progress(downloaded, total, percent, speed):
+            self.after(0, lambda: self._update_progress_ui(downloaded, total, percent, speed))
+
+        try:
+            saved_path = updater.download_update(
+                url,
+                dest_file,
+                progress_callback=on_progress,
+                cancel_event=self.cancel_event,
+            )
+            self.after(0, lambda: self._on_download_success(saved_path))
+        except InterruptedError:
+            self.after(0, self._on_download_cancelled)
+        except Exception as exc:
+            self.after(0, lambda: self._on_download_error(str(exc)))
+
+    def _update_progress_ui(self, downloaded, total, percent, speed):
+        self.progress_bar["value"] = percent
+        dl_mb = downloaded / (1024 * 1024)
+        total_mb = total / (1024 * 1024) if total > 0 else 0
+        speed_kb = speed / 1024
+        speed_text = f"{speed_kb / 1024:.2f} MB/s" if speed_kb >= 1024 else f"{speed_kb:.0f} KB/s"
+
+        if total > 0:
+            status_text = f"{percent:.1f}% ({dl_mb:.1f} MB / {total_mb:.1f} MB) • ความเร็ว {speed_text}"
+        else:
+            status_text = f"ดาวน์โหลดแล้ว {dl_mb:.1f} MB • ความเร็ว {speed_text}"
+
+        self.lbl_status.config(text=status_text)
+
+        int_pct = int(percent)
+        if int_pct >= self._last_nvda_pct + 25:
+            self._last_nvda_pct = (int_pct // 25) * 25
+            nvda.speak(f"ดาวน์โหลดอัปเดต {self._last_nvda_pct} เปอร์เซ็นต์")
+
+    def _on_download_success(self, installer_path: Path):
+        self.progress_bar["value"] = 100
+        self.lbl_status.config(
+            text="✅ ดาวน์โหลดเสร็จสมบูรณ์! กำลังปิดโปรแกรมและเริ่มการติดตั้ง...",
+            foreground="#16a34a",
+        )
+        self.btn_cancel.config(state="disabled")
+        nvda.speak("ดาวน์โหลดเสร็จสมบูรณ์ ระบบกำลังปิดโปรแกรมและเริ่มการติดตั้งเวอร์ชันใหม่")
+        self.after(800, lambda: self._launch_installer(installer_path))
+
+    def _launch_installer(self, installer_path: Path):
+        try:
+            updater.launch_installer_and_exit(installer_path, on_before_exit=self.parent.on_close)
+        except Exception as exc:
+            messagebox.showerror("เปิดตัวติดตั้งไม่สำเร็จ", f"ไม่สามารถเปิดไฟล์ตัวติดตั้งได้:\n{exc}")
+            self.destroy()
+
+    def _on_download_cancelled(self):
+        self.lbl_status.config(text="ยกเลิกการดาวน์โหลดแล้ว", foreground="#dc2626")
+        self.destroy()
+
+    def _on_download_error(self, err_msg: str):
+        nvda.speak(f"ดาวน์โหลดอัปเดตล้มเหลว {err_msg}")
+        messagebox.showerror(
+            "ดาวน์โหลดไม่สำเร็จ",
+            f"เกิดข้อผิดพลาดระหว่างดาวน์โหลดไฟล์อัปเดต:\n{err_msg}\n\nกรุณาตรวจสอบการเชื่อมต่ออินเทอร์เน็ตแล้วลองใหม่อีกครั้ง",
+        )
+        self.destroy()
+
+    def on_cancel(self):
+        self.cancel_event.set()
+        self.lbl_status.config(text="กำลังยกเลิก...")
+        self.btn_cancel.config(state="disabled")
+
+def write_diagnostics(filename):
+    """Offline check for deployment support; no sound, shutdown or listener."""
+    app_paths.initialize_storage()
+    database.init_db()
+    try:
+        with open(config_manager.CONFIG_FILE, encoding='utf-8') as stream:
+            config_manager.validate_settings(json.load(stream))
+        settings_valid = True
+    except (OSError, ValueError, TypeError):
+        settings_valid = False
+    report = {
+        'frozen': bool(getattr(sys, 'frozen', False)),
+        'state_dir': str(app_paths.STATE_DIR),
+        'sound_dir': str(app_paths.SOUND_DIR),
+        'wav_files': len(list(app_paths.SOUND_DIR.rglob('*.wav'))),
+        'schedule_slots': sum(len(database.get_schedules_for_day(day)) for day in range(1, 9)),
+        'settings_valid': settings_valid,
+    }
+    with open(filename, 'w', encoding='utf-8') as stream:
+        json.dump(report, stream, ensure_ascii=False, indent=2)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) == 3 and sys.argv[1] == '--diagnose':
+        write_diagnostics(sys.argv[2])
+    else:
+        from instance_lock import InstanceLock
+        lock = InstanceLock(app_paths.STATE_DIR)
+        if not lock.acquired:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, 'โปรแกรมกำลังเปิดใช้งานกับข้อมูลชุดนี้อยู่แล้ว', 'Smart School Chime', 0x40)
+            sys.exit(0)
+        try:
+            app = SmartSchoolChimeApp()
+            app.mainloop()
+        finally:
+            lock.close()
